@@ -1,5 +1,6 @@
 mod calibrator;
 mod fluke;
+mod measurement_unit;
 mod serial;
 
 #[tauri::command]
@@ -20,6 +21,14 @@ async fn _stop_thermal_calibration() {
     calibrator::calibrator_manager::stop_thermal_calibration()
 }
 
+#[tauri::command]
+async fn get_muinfo(
+) -> Result<measurement_unit::measurement_unit_processor::MeasurementUnitDTO, String> {
+    measurement_unit::measurement_unit_processor::run_sync_process()
+        .await
+        .map_err(|e| e.to_string()) // Converte l'errore in stringa per il frontend
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -27,7 +36,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             _start_thermal_calibration,
-            _stop_thermal_calibration
+            _stop_thermal_calibration,
+            get_muinfo
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

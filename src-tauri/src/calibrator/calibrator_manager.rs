@@ -83,6 +83,8 @@ pub async fn start_thermal_calibration(
                     // Se riceviamo un errore di IO (es. USB staccata),
                     // read_available dovrebbe idealmente restituire un errore o un buffer vuoto.
                     // Se vuoi gestire il distacco fisico qui:
+                    println!("{:?}", data);
+                    println!("Converted DATA {:?}", process_ntc_packet(data.clone()));
                     let _ = tx_sensor.send(data);
                 }
 
@@ -161,7 +163,7 @@ pub async fn start_thermal_calibration(
                     total_time: step.tempo_per_step * 60,
                     status,
                 };
-                //println!("{:?}", payload);
+                println!("{:?}", payload);
 
                 // 5. Invio UI e Log (Kafka/File)
                 app.emit("calibration-update", &payload).unwrap();

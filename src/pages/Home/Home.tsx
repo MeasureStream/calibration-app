@@ -1,55 +1,93 @@
-import { Container, Button } from 'react-bootstrap';
+import { useState } from 'react';
+import { Container, Button, Spinner, Alert } from 'react-bootstrap';
 import { useNavigate } from 'react-router-dom';
 import logo from '../../assets/pi-logo50x70.png'
 import { useContextApp } from '../../context/ContextApp';
+import { getMUInfo } from '../../api/rest-api'; // Importiamo il comando Tauri
 
 import {
   GraphUp,
   ArrowRepeat,
-  Search
+  Search,
+  Cpu // Nuova icona per l'hardware
 } from 'react-bootstrap-icons';
 
 const Home = () => {
   const navigate = useNavigate();
   const { version } = useContextApp();
 
+  // Stati per gestire la sincronizzazione
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
   const iconSize = 28;
+
+  // Funzione che gestisce il recupero info prima di navigare
+  const handleStartCalibration = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+
+      // Chiamata al backend tramite Rust
+      const mu = await getMUInfo();
+      console.log("Hardware sincronizzato:", mu);
+
+      // Se tutto va bene, navighiamo alla pagina taratura
+      navigate('/taratura');
+    } catch (err) {
+      console.error(err);
+      setError("Errore sincronizzazione hardware. Controlla la connessione.");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
     <Container fluid className="vh-100 d-flex flex-column justify-content-center align-items-center">
 
       {/* Header */}
       <div className="text-center mb-5">
-
         <div className="d-flex justify-content-center align-items-center gap-3 mb-2">
           <img src={logo} alt="Logo" style={{ height: '70px' }} />
-
           <h1 className="fw-bold mb-0">
             Travelling Calibrator
           </h1>
         </div>
-
         <div className="text-secondary">
           Version {version}
         </div>
-
       </div>
 
+      {/* Messaggio di Errore se il sync fallisce */}
+      {error && (
+        <Alert variant="danger" className="w-100 mb-4" style={{ maxWidth: '320px' }}>
+          {error}
+        </Alert>
+      )}
 
       {/* Buttons */}
       <div
         className="d-grid gap-3"
         style={{ width: '100%', maxWidth: '320px' }}
       >
-
         <Button
           variant="primary"
           size="lg"
+          disabled={loading} // Disabilita durante il caricamento
           className="fw-bold py-3 d-flex align-items-center justify-content-center gap-2"
-          onClick={() => navigate('/taratura')}
+          onClick={handleStartCalibration}
         >
-          <GraphUp size={iconSize} />
-          TARATURA
+          {loading ? (
+            <>
+              <Spinner animation="border" size="sm" />
+              SINCRONIZZAZIONE...
+            </>
+          ) : (
+            <>
+              <GraphUp size={iconSize} />
+              TARATURA
+            </>
+          )}
         </Button>
 
         <Button
@@ -71,7 +109,6 @@ const Home = () => {
           <Search size={iconSize} />
           DEV. STATUS
         </Button>
-
       </div>
 
     </Container>
