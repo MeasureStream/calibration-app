@@ -3,18 +3,40 @@ use std::env;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct SensorDTO {
+pub struct SensorTemplateDTO {
     pub model_name: String,
-    pub sensor_index: i32,
+    pub r#type: String,
+    pub unit: String,
+    pub conversion: Option<serde_json::Value>,
+    pub properties: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct SensorDTO {
+    pub id: i64,
+    pub model_name: String,
+    pub sensor_index: i32,
+    pub phys_val: f32,
+    pub elec_val: f32,
+    pub sampling_f: f32,
+    // Coefficienti per la taratura
+    pub coeff_a: Option<f32>,
+    pub coeff_b: Option<f32>,
+    pub coeff_c: Option<f32>,
+    pub coeff_d: Option<f32>,
+    pub cal_date: Option<String>,
+    // Aggancio al template ricevuto dal server
+    pub sensor_template: SensorTemplateDTO,
+}
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct MeasurementUnitDTO {
     pub id: i64,
-    pub network_id: i64,
+    pub extended_id: i64,
+    pub local_id: i32,
     pub model: i32,
-    pub node_id: Option<i64>,
+    pub control_unit_id: i64,
     pub sensors: Vec<SensorDTO>,
 }
 
@@ -46,12 +68,12 @@ pub async fn get_access_token(
 
     if status.is_success() {
         let token_data: KeycloakToken = response.json().await?;
-        println!("✅ JSON Token decodificato correttamente!"); // <-- AGGIUNGI QUESTO
+        println!("JSON Token decodificato correttamente!"); // <-- AGGIUNGI QUESTO
         Ok(token_data.access_token)
     } else {
         // Leggiamo il testo dell'errore per capire se è "Invalid Client", "Unknown Realm", ecc.
         let error_text = response.text().await?;
-        println!("❌ Errore Keycloak DETTAGLIATO: {}", error_text);
+        println!("Errore Keycloak DETTAGLIATO: {}", error_text);
         Err(format!("Errore Keycloak ({}): {}", status, error_text).into())
     }
 }
@@ -64,10 +86,10 @@ async fn get_or_create_mu(
     // aggiungi ip diretto a tailascale measurestream e metti ports 8080:8081
     let base_url = "https://www.christiandellisanti.uk/API/measurementunits";
     let auth_value = format!("Bearer {}", token);
-    println!("DEBUG: Authorization Header: {}...", &auth_value[..20]);
+    println!("DEBUG: Authorization Header: {}...", &auth_value);
 
     // Costruiamo l'URL con il parametro networkId
-    let url_with_query = format!("{}?networkId={}", base_url, mu_to_check.network_id);
+    let url_with_query = format!("{}?extendedId={}", base_url, mu_to_check.extended_id);
 
     println!("DEBUG: Invio GET a: {}", url_with_query);
 
@@ -89,43 +111,56 @@ async fn get_or_create_mu(
         println!("DEBUG: Numero unità trovate: {}", units.len());
 
         if let Some(existing_unit) = units.first() {
-            println!("✅ Unità esistente trovata: ID {}", existing_unit.id);
-            return Ok(existing_unit.clone());
+            println!("Unità esistente trovata: ID {}", existing_unit.id);
+            Ok(existing_unit.clone())
+        } else {
+            println!(
+                "Errore MU non trovata extended_id: {} non esitente",
+                mu_to_check.extended_id
+            );
+            Err(format!(
+                "Errore MU non trovata extended_id: {} non esitente",
+                mu_to_check.extended_id
+            )
+            .into())
         }
     } else {
         let err_text = response.text().await?;
-        println!("❌ Errore API (GET): {} - {}", status, err_text);
-        return Err(format!("Errore API: {}", status).into());
+        println!("Errore API (GET): {} - {}", status, err_text);
+        Err(format!("Errore API: {}", status).into())
     }
+    /*
+        // 2. Se arriviamo qui, l'array era vuoto. Creiamo la MU.
+        println!("DEBUG: MU non trovata, invio POST di creazione...");
 
-    // 2. Se arriviamo qui, l'array era vuoto. Creiamo la MU.
-    println!("DEBUG: MU non trovata, invio POST di creazione...");
+        let response_post = client
+            .post(base_url) // Senza query string per la POST
+            .header("Authorization", &auth_value)
+            .json(mu_to_check)
+            .send()
+            .await?;
 
-    let response_post = client
-        .post(base_url) // Senza query string per la POST
-        .header("Authorization", &auth_value)
-        .json(mu_to_check)
-        .send()
-        .await?;
+        let status_post = response_post.status();
+        println!("DEBUG: Status POST: {}", status_post);
 
-    let status_post = response_post.status();
-    println!("DEBUG: Status POST: {}", status_post);
-
-    if status_post.is_success() || status_post == reqwest::StatusCode::CREATED {
-        let new_unit: MeasurementUnitDTO = response_post.json().await?;
-        println!("✅ Nuova unità creata con ID: {}", new_unit.id);
-        Ok(new_unit)
-    } else {
-        let err_text = response_post.text().await?;
-        println!("❌ Errore durante la POST: {}", err_text);
-        Err(format!("Errore creazione MU: {}", status_post).into())
-    }
+        if status_post.is_success() || status_post == reqwest::StatusCode::CREATED {
+            let new_unit: MeasurementUnitDTO = response_post.json().await?;
+            println!("Nuova unità creata con ID: {}", new_unit.id);
+            Ok(new_unit)
+        } else {
+            let err_text = response_post.text().await?;
+            println!("Errore durante la POST: {}", err_text);
+            Err(format!("Errore creazione MU: {}", status_post).into())
+        }
+    */
 }
-pub async fn run_sync_process() -> Result<MeasurementUnitDTO, Box<dyn std::error::Error>> {
+pub async fn run_sync_process(
+    mu_serial_id: i64,
+) -> Result<MeasurementUnitDTO, Box<dyn std::error::Error>> {
     // Prova a caricare il .env
     match dotenvy::dotenv() {
-        Ok(path) => println!("✅ File .env caricato da: {:?}", path),
-        Err(e) => println!("⚠️ Attenzione: Impossibile caricare il file .env: {}", e),
+        Ok(path) => println!("File .env caricato da: {:?}", path),
+        Err(e) => println!("Attenzione: Impossibile caricare il file .env: {}", e),
     }
 
     // Lettura e stampa delle variabili
@@ -151,24 +186,27 @@ pub async fn run_sync_process() -> Result<MeasurementUnitDTO, Box<dyn std::error
 
     println!("Tentativo di ottenere il token da Keycloak...");
     let token = get_access_token(&client_id, &client_secret, &realm_url).await?;
-    println!("✅ Token ottenuto!");
+    println!("Token ottenuto!");
 
+    //TODO("Questo è da cambiare l'applicazione deve controllare se esiste, se non esiste deve
+    //creare l'entità sul server, perché il server è l'unico che ha la conoscenza dei template")
     let mu_to_check = MeasurementUnitDTO {
         id: 0,
-        network_id: 12345,
-        model: 1,
-        node_id: None,
+        extended_id: mu_serial_id,
+        local_id: 0,
+        model: 0,
+        control_unit_id: 0,
         sensors: vec![],
     };
 
     let client = reqwest::Client::new();
 
     println!(
-        "Tentativo get_or_create per NetworkID: {}",
-        mu_to_check.network_id
+        "Tentativo get_or_create per extended_id: {}",
+        mu_to_check.extended_id
     );
     let mu = get_or_create_mu(&client, &mu_to_check, &token).await?;
-    println!("✅ Processo completato con successo per MU ID: {}", mu.id);
+    println!("Processo completato con successo per MU ID: {}", mu.id);
 
     Ok(mu)
 }

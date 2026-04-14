@@ -14,7 +14,7 @@ import {
 
 const Home = () => {
   const navigate = useNavigate();
-  const { version } = useContextApp();
+  const { version, setMu } = useContextApp();
 
   // Stati per gestire la sincronizzazione
   const [loading, setLoading] = useState(false);
@@ -24,12 +24,14 @@ const Home = () => {
 
   // Funzione che gestisce il recupero info prima di navigare
   const handleStartCalibration = async () => {
+
     try {
       setLoading(true);
       setError(null);
 
       // Chiamata al backend tramite Rust
       const mu = await getMUInfo();
+      setMu(mu);
       console.log("Hardware sincronizzato:", mu);
 
       // Se tutto va bene, navighiamo alla pagina taratura

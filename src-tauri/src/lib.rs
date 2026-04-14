@@ -24,7 +24,7 @@ async fn _stop_thermal_calibration() {
 #[tauri::command]
 async fn get_muinfo(
 ) -> Result<measurement_unit::measurement_unit_processor::MeasurementUnitDTO, String> {
-    measurement_unit::measurement_unit_processor::run_sync_process()
+    measurement_unit::measurement_unit_processor::run_sync_process(65537)
         .await
         .map_err(|e| e.to_string()) // Converte l'errore in stringa per il frontend
 }
