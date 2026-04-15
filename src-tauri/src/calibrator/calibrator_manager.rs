@@ -38,7 +38,7 @@ pub fn get_or_init_sensor_port() -> Result<Arc<Mutex<Option<SerialDevice>>>, Str
     // Se la porta non esiste o è stata chiusa (None), la inizializziamo
     if guard.is_none() {
         println!("Tentativo di apertura seriale e Handshake...");
-        let mut port = SerialDevice::open_by_vid_pid(0x10c4, 0xea60, 115200, 0)
+        let mut port = SerialDevice::open_by_vid_pid(0x1a86, 0x7523, 115200, 0)
             .map_err(|e| format!("Errore hardware: {}", e))?;
 
         // Eseguiamo l'handshake SOLO QUI (una volta sola)
@@ -83,7 +83,7 @@ pub async fn start_thermal_calibration(
                     // Se riceviamo un errore di IO (es. USB staccata),
                     // read_available dovrebbe idealmente restituire un errore o un buffer vuoto.
                     // Se vuoi gestire il distacco fisico qui:
-                    println!("{:?}", data);
+                    println!("NOT COVERTED DATA {:?}", data);
                     println!("Converted DATA {:?}", process_ntc_packet(data.clone()));
                     let _ = tx_sensor.send(data);
                 }
@@ -191,13 +191,32 @@ pub fn stop_thermal_calibration() {
 }
 
 fn process_ntc_packet(packet: Vec<u8>) -> Vec<f32> {
+    const R0: f32 = 10000.0; // Esempio: 10k Ohm (Valore di riferimento NTC)
+    const B: f32 = 4190.0; // Beta coefficient
+    const T0: f32 = 298.15; // 25°C in Kelvin
+    const ADC_MAX: f32 = 4095.0; // Per un ADC a 12 bit
+
     packet
         .chunks_exact(2)
         .map(|chunk| {
-            // Uniamo i due byte in un intero a 16 bit (Big Endian come da tua tabella precedente)
-            let raw_val = u16::from_be_bytes([chunk[0], chunk[1]]);
-            let l = (3.3 / (raw_val as f32) - 1.0).ln();
-            1.0 / (l / 4190.0 + 1.0 / 298.15)
+            // Lettura Big Endian (corretto, allineato a Python)
+            let raw_val = u16::from_le_bytes([chunk[0], chunk[1]]);
+
+            // 1. Protezione contro la divisione per zero
+            if raw_val == 0 {
+                return -273.15; // O un valore di errore predefinito
+            }
+
+            // 2. Calcolo Resistenza NTC (allineato a Python)
+            // Rntc = R0 * ( (ADC_MAX / sample) - 1 )
+            let r_ntc = R0 * (ADC_MAX / raw_val as f32 - 1.0);
+
+            // 3. Equazione di Steinhart-Hart (Beta)
+            let ln_r = (r_ntc / R0).ln();
+            let t_kelvin = 1.0 / (1.0 / T0 + ln_r / B);
+
+            // 4. Conversione in Celsius (come nel print di Python)
+            t_kelvin - 273.15
         })
         .collect()
 }
