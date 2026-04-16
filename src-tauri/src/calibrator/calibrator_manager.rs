@@ -1,5 +1,7 @@
 use crate::fluke::fluke_manager::Fluke9142;
+use crate::mqtt::mqtt_manager::publish_calibration_report;
 use crate::serial::serial_manager::SerialDevice;
+use chrono::Local;
 use core::f32;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +27,33 @@ pub struct CalibrationPayload {
     pub elapsed_time: u32,
     pub total_time: u32,
     pub status: String, // "RAMPA", "DWELL"
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct FinalCalibrationReport {
+    pub calibration_id: String,
+    pub calibrator_id: u32,
+    pub mu_id: u32,
+    pub sensor_id: u32,
+    pub steps: Vec<(f32, u32)>, // (Target, Minuti)
+    pub reference_temperature_samples: Vec<RefSample>,
+    pub sensor_raw_samples: Vec<RawSample>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct RefSample {
+    pub index_step: usize,
+    pub timestamp: String, // ISO 8601
+    pub target: f32,
+    pub reading: f32,
+    pub stable_hw: bool,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct RawSample {
+    pub index_step: usize,
+    pub timestamp: String, // ISO 8601
+    pub value_hex: String,
 }
 
 static IS_RUNNING: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
@@ -59,14 +88,27 @@ pub async fn start_thermal_calibration(
 
     IS_RUNNING.store(true, Ordering::SeqCst);
 
+    let ref_samples = Arc::new(Mutex::new(Vec::<RefSample>::new()));
+    let raw_samples = Arc::new(Mutex::new(Vec::<RawSample>::new()));
+    let current_step_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Copia degli step per il report finale (visto che steps verrà consumato dal ciclo)
+    let steps_for_report: Vec<(f32, u32)> = steps
+        .iter()
+        .map(|s| (s.target_value, s.tempo_per_step))
+        .collect();
+
     // Canale unico per il sensore -> Master
     let (tx_sensor, rx_sensor) = mpsc::channel::<Vec<u8>>();
 
-    // --- THREAD 1: LETTURA SENSORE (Produttore ad alta velocità) ---
+    // --- THREAD 1: LETTURA SENSORE ---
     let stop_sensor = IS_RUNNING.clone();
     let port_arc_thread = port_arc.clone();
+    let raw_samples_thread1 = raw_samples.clone(); // Clone per il Thread 1
+    let step_idx_raw = current_step_idx.clone();
 
     std::thread::spawn(move || {
+        let mut local_raw_buffer = Vec::new();
         let mut guard = port_arc_thread.lock().unwrap();
 
         if let Some(ref mut sensor_port) = *guard {
@@ -76,37 +118,40 @@ pub async fn start_thermal_calibration(
             }
 
             while stop_sensor.load(Ordering::SeqCst) {
-                // 3. Leggiamo i dati
                 let data = sensor_port.read_available();
-
                 if !data.is_empty() {
-                    // Se riceviamo un errore di IO (es. USB staccata),
-                    // read_available dovrebbe idealmente restituire un errore o un buffer vuoto.
-                    // Se vuoi gestire il distacco fisico qui:
-                    println!("NOT COVERTED DATA {:?}", data);
-                    println!("Converted DATA {:?}", process_ntc_packet(data.clone()));
+                    local_raw_buffer.push(RawSample {
+                        index_step: step_idx_raw.load(Ordering::SeqCst),
+                        timestamp: Local::now().to_rfc3339(),
+                        value_hex: data.iter().map(|b| format!("{:02x}", b)).collect(),
+                    });
                     let _ = tx_sensor.send(data);
                 }
-
                 std::thread::sleep(Duration::from_millis(10));
             }
 
+            // Versamento finale nel Mutex
+            let mut guard_samples = raw_samples_thread1.lock().unwrap();
+            *guard_samples = local_raw_buffer;
+
             let _ = sensor_port.stop_mu_calibration(0x01, 0x04);
-            println!("Streaming MU terminato correttamente.");
-        } else {
-            eprintln!("Errore: La porta seriale non è inizializzata.");
         }
     });
 
+    // --- THREAD 2: MASTER ---
+    let ref_samples_thread2 = ref_samples.clone(); // Clone per il Thread 2
+    let raw_samples_thread2 = raw_samples.clone(); // Clone per l'assemblaggio finale nel Thread 2
+    let step_idx_master = current_step_idx.clone();
+    let stop_master = IS_RUNNING.clone();
     let _total_steps = steps.len();
 
-    // --- THREAD 2: MASTER (Regolatore, Assemblatore e Notificatore) ---
-    let stop_master = IS_RUNNING.clone();
     std::thread::spawn(move || {
+        let mut local_ref_buffer = Vec::new();
         let mut fluke = Fluke9142::new().expect("Impossibile connettersi al Fluke");
         fluke.start_heating();
 
         for (index, step) in steps.into_iter().enumerate() {
+            step_idx_master.store(index, Ordering::SeqCst);
             fluke.set_temperature(step.target_value);
 
             let mut is_stable_reached = false;
@@ -114,7 +159,6 @@ pub async fn start_thermal_calibration(
             let total_dwell_secs = (step.tempo_per_step * 60) as u64;
 
             while stop_master.load(Ordering::SeqCst) {
-                // 1. Lettura Fluke + Timestamp
                 let f_temp = fluke.read_temperature().unwrap_or(0.0);
                 let f_stable = fluke.is_stable();
                 let now = std::time::SystemTime::now()
@@ -122,18 +166,17 @@ pub async fn start_thermal_calibration(
                     .unwrap()
                     .as_millis() as u64;
 
+                // Svuota canale sensore per la UI
                 let mut all_data = Vec::new();
                 while let Ok(p) = rx_sensor.try_recv() {
                     all_data.extend(p);
                 }
-
                 let s_temp = if !all_data.is_empty() {
                     process_ntc_packet(all_data)
                 } else {
                     vec![]
                 };
 
-                // 3. Gestione Stati e Tempo
                 let mut status = "RAMPA".to_string();
                 let mut elapsed = 0u32;
 
@@ -146,32 +189,36 @@ pub async fn start_thermal_calibration(
                 } else if let Some(start) = start_dwell {
                     elapsed = start.elapsed().as_secs() as u32;
                     status = "DWELL".to_string();
+
+                    // Salvataggio campioni durante DWELL
+                    local_ref_buffer.push(RefSample {
+                        index_step: index,
+                        timestamp: Local::now().to_rfc3339(),
+                        target: step.target_value,
+                        reading: f_temp,
+                        stable_hw: f_stable,
+                    });
+
                     if elapsed >= total_dwell_secs as u32 {
                         break;
                     }
                 }
 
-                // 4. Creazione Payload Unificato con Timestamp
-                let payload = CalibrationPayload {
-                    timestamp: now, // Timestamp univoco per il sync
-                    current_temp_fluke: f_temp,
-                    current_temp_sensor: s_temp,
-                    is_stable: f_stable,
-                    current_step: index + 1,
-                    total_steps: _total_steps,
-                    elapsed_time: elapsed,
-                    total_time: step.tempo_per_step * 60,
-                    status,
-                };
-                println!("{:?}", payload);
-
-                // 5. Invio UI e Log (Kafka/File)
-                app.emit("calibration-update", &payload).unwrap();
-
-                if payload.status == "DWELL" {
-                    // Esegui qui il salvataggio ad ogni secondo di dwell
-                    // save_to_log(&payload);
-                }
+                app.emit(
+                    "calibration-update",
+                    &CalibrationPayload {
+                        timestamp: now,
+                        current_temp_fluke: f_temp,
+                        current_temp_sensor: s_temp,
+                        is_stable: f_stable,
+                        current_step: index + 1,
+                        total_steps: _total_steps,
+                        elapsed_time: elapsed,
+                        total_time: step.tempo_per_step * 60,
+                        status,
+                    },
+                )
+                .unwrap();
 
                 std::thread::sleep(Duration::from_millis(1000));
             }
@@ -179,13 +226,40 @@ pub async fn start_thermal_calibration(
                 break;
             }
         }
+
         fluke.stop_heating();
         IS_RUNNING.store(false, Ordering::SeqCst);
+
+        // --- ASSEMBLAGGIO FINALE ---
+        {
+            let mut guard = ref_samples_thread2.lock().unwrap();
+            *guard = local_ref_buffer;
+        }
+
+        let calib_id = format!("calib-1-1-{}", Local::now().format("%Y-%m-%dT%H:%M:%S"));
+
+        let final_report = FinalCalibrationReport {
+            calibration_id: calib_id,
+            calibrator_id: 1,
+            mu_id: 1,
+            sensor_id: 1,
+            steps: steps_for_report, // Ora popolato correttamente
+            reference_temperature_samples: ref_samples_thread2.lock().unwrap().clone(),
+            sensor_raw_samples: raw_samples_thread2.lock().unwrap().clone(),
+        };
+
+        let report_to_send = serde_json::to_string(&final_report).unwrap();
+        println!("Calibrazione completata. Report generato.");
+        // json_final a MQTT
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            if let Err(e) = publish_calibration_report(report_to_send).await {
+                eprintln!("Fallimento invio finale: {}", e);
+            }
+        });
     });
 
     Ok(())
 }
-
 pub fn stop_thermal_calibration() {
     IS_RUNNING.store(false, Ordering::SeqCst);
 }

@@ -1,6 +1,7 @@
 mod calibrator;
 mod fluke;
 mod measurement_unit;
+mod mqtt;
 mod serial;
 
 #[tauri::command]
