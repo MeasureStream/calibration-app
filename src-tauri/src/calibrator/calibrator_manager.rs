@@ -1,9 +1,10 @@
 use crate::fluke::fluke_manager::Fluke9142;
 use crate::mqtt::mqtt_manager::publish_calibration_report;
 use crate::serial::serial_manager::SerialDevice;
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use core::f32;
 use once_cell::sync::Lazy;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -20,40 +21,34 @@ pub struct CalibrationStep {
 pub struct CalibrationPayload {
     pub timestamp: u64,
     pub current_temp_fluke: f32,
-    pub current_temp_sensor: Vec<f32>,
+    pub current_temp_sensor: f32,
+    pub samples_count: usize,
     pub is_stable: bool,
     pub current_step: usize,
     pub total_steps: usize,
     pub elapsed_time: u32,
     pub total_time: u32,
-    pub status: String, // "RAMPA", "DWELL"
+    pub status: String,
 }
-
-#[derive(serde::Serialize, Clone)]
-pub struct FinalCalibrationReport {
-    pub calibration_id: String,
-    pub calibrator_id: u32,
-    pub mu_id: u32,
-    pub sensor_id: u32,
-    pub steps: Vec<(f32, u32)>, // (Target, Minuti)
-    pub reference_temperature_samples: Vec<RefSample>,
-    pub sensor_raw_samples: Vec<RawSample>,
-}
-
-#[derive(serde::Serialize, Clone)]
-pub struct RefSample {
-    pub index_step: usize,
-    pub timestamp: String, // ISO 8601
+#[derive(serde::Serialize)]
+pub struct StepData {
     pub target: f32,
-    pub reading: f32,
-    pub stable_hw: bool,
+    pub step_index: usize,
+    pub minutes: u32,
+    pub start_time: DateTime<Utc>,
+    pub start_time_dwell: DateTime<Utc>,
+    // Qui mettiamo le liste piatte per questo specifico step
+    pub ref_readings: Vec<f32>, // 1 lettura al secondo
+    pub sensor: Vec<u8>,        // N letture al secondo (es. 100Hz)
+    pub sensor_sampling_freq: u16,
 }
 
-#[derive(serde::Serialize, Clone)]
-pub struct RawSample {
-    pub index_step: usize,
-    pub timestamp: String, // ISO 8601
-    pub value_hex: String,
+#[derive(serde::Serialize)]
+pub struct FinalCompactReport {
+    pub calibration_id: String,
+    pub sensor_id: u32,
+    pub sensor_freq_hz: u32,
+    pub steps: Vec<StepData>, // Ogni elemento è un blocco Target + Dati
 }
 
 static IS_RUNNING: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
@@ -71,7 +66,7 @@ pub fn get_or_init_sensor_port() -> Result<Arc<Mutex<Option<SerialDevice>>>, Str
             .map_err(|e| format!("Errore hardware: {}", e))?;
 
         // Eseguiamo l'handshake SOLO QUI (una volta sola)
-        port.connect_mu(0x00)
+        port.connect_mu(0x01)
             .map_err(|e| format!("MU non risponde: {}", e))?;
 
         *guard = Some(port);
@@ -84,175 +79,214 @@ pub async fn start_thermal_calibration(
     app: AppHandle,
     steps: Vec<CalibrationStep>,
 ) -> Result<(), String> {
-    let port_arc = get_or_init_sensor_port()?;
+    let port_arc = get_or_init_sensor_port().map_err(|e| format!("Hardware non pronto: {}", e))?;
+    let mut fluke = Fluke9142::new().map_err(|e| format!("Fluke non trovato: {}", e))?;
 
     IS_RUNNING.store(true, Ordering::SeqCst);
 
-    let ref_samples = Arc::new(Mutex::new(Vec::<RefSample>::new()));
-    let raw_samples = Arc::new(Mutex::new(Vec::<RawSample>::new()));
+    let app_sensor = app.clone();
+    let app_master = app.clone();
+
+    let freq_campionamento = 1; //Hz
+
     let current_step_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop_signal = IS_RUNNING.clone();
 
-    // Copia degli step per il report finale (visto che steps verrà consumato dal ciclo)
-    let steps_for_report: Vec<(f32, u32)> = steps
-        .iter()
-        .map(|s| (s.target_value, s.tempo_per_step))
-        .collect();
-
-    // Canale unico per il sensore -> Master
+    // Canale per i byte grezzi: Sensore -> Master
     let (tx_sensor, rx_sensor) = mpsc::channel::<Vec<u8>>();
 
-    // --- THREAD 1: LETTURA SENSORE ---
-    let stop_sensor = IS_RUNNING.clone();
+    // --- THREAD 1: LETTURA SENSORE (Ultra-Light) ---
     let port_arc_thread = port_arc.clone();
-    let raw_samples_thread1 = raw_samples.clone(); // Clone per il Thread 1
-    let step_idx_raw = current_step_idx.clone();
-
+    let stop_sensor = stop_signal.clone();
     std::thread::spawn(move || {
-        let mut local_raw_buffer = Vec::new();
         let mut guard = port_arc_thread.lock().unwrap();
-
         if let Some(ref mut sensor_port) = *guard {
-            if let Err(e) = sensor_port.start_mu_calibration(0x04, 100, 128) {
+            if let Err(e) = sensor_port.start_mu_calibration(0x04, freq_campionamento, 128) {
                 eprintln!("Errore avvio streaming: {}", e);
+                handle_fatal_error(&app_sensor, "Errore Avvio MU");
                 return;
             }
 
             while stop_sensor.load(Ordering::SeqCst) {
-                let data = sensor_port.read_available();
-                if !data.is_empty() {
-                    local_raw_buffer.push(RawSample {
-                        index_step: step_idx_raw.load(Ordering::SeqCst),
-                        timestamp: Local::now().to_rfc3339(),
-                        value_hex: data.iter().map(|b| format!("{:02x}", b)).collect(),
-                    });
-                    let _ = tx_sensor.send(data);
+                match sensor_port.read_packet(128) {
+                    Ok(data) => {
+                        let _ = tx_sensor.send(data);
+                    }
+                    Err(e) => {
+                        // Se è un timeout, semplicemente riprova il ciclo
+                        if e.contains("timed out") {
+                            continue;
+                        }
+                        eprintln!("Errore critico seriale: {}", e);
+                        break;
+                    }
                 }
-                std::thread::sleep(Duration::from_millis(10));
             }
-
-            // Versamento finale nel Mutex
-            let mut guard_samples = raw_samples_thread1.lock().unwrap();
-            *guard_samples = local_raw_buffer;
-
-            let _ = sensor_port.stop_mu_calibration(0x01, 0x04);
+            let res = sensor_port.stop_mu_calibration(0x00);
+            println!("Esito stop: {:?}", res);
         }
     });
 
-    // --- THREAD 2: MASTER ---
-    let ref_samples_thread2 = ref_samples.clone(); // Clone per il Thread 2
-    let raw_samples_thread2 = raw_samples.clone(); // Clone per l'assemblaggio finale nel Thread 2
-    let step_idx_master = current_step_idx.clone();
-    let stop_master = IS_RUNNING.clone();
-    let _total_steps = steps.len();
+    // --- THREAD 2: MASTER (Logica e Assemblaggio) ---
+    let stop_master = stop_signal.clone();
+    let total_steps = steps.len();
 
     std::thread::spawn(move || {
-        let mut local_ref_buffer = Vec::new();
-        let mut fluke = Fluke9142::new().expect("Impossibile connettersi al Fluke");
+        let mut final_steps_reports = Vec::new();
+        //let mut fluke = Fluke9142::new().expect("Errore Apertura Fluke9142");
+        let start_time = chrono::Utc::now();
         fluke.start_heating();
 
         for (index, step) in steps.into_iter().enumerate() {
-            step_idx_master.store(index, Ordering::SeqCst);
+            current_step_idx.store(index, Ordering::SeqCst);
             fluke.set_temperature(step.target_value);
 
+            let mut current_step_ref = Vec::new();
+            //let mut current_step_raw = Vec::new();
+            let mut byte_accumulator = Vec::new();
             let mut is_stable_reached = false;
             let mut start_dwell: Option<std::time::Instant> = None;
             let total_dwell_secs = (step.tempo_per_step * 60) as u64;
+            let mut start_time_dwell = None;
+
+            // BUFFER: conterrà le medie al secondo degli ultimi 60 secondi
+            let mut second_averages_buffer: VecDeque<f32> = VecDeque::with_capacity(60);
+            let mut last_receive_time = std::time::Instant::now();
 
             while stop_master.load(Ordering::SeqCst) {
-                let f_temp = fluke.read_temperature().unwrap_or(0.0);
-                let f_stable = fluke.is_stable();
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
+                let f_temp = match fluke.read_temperature() {
+                    Some(t) => t,
 
-                // Svuota canale sensore per la UI
-                let mut all_data = Vec::new();
-                while let Ok(p) = rx_sensor.try_recv() {
-                    all_data.extend(p);
-                }
-                let s_temp = if !all_data.is_empty() {
-                    process_ntc_packet(all_data)
-                } else {
-                    vec![]
+                    None => {
+                        handle_fatal_error(&app_master, "Persa connessione con Fluke9142");
+
+                        return; // Esce dal thread
+                    }
                 };
+                let f_stable = fluke.is_stable();
+
+                // 1. Prendi i 100 campioni del secondo attuale e fai la media
+                let mut samples_this_second = Vec::new();
+                while let Ok(data) = rx_sensor.try_recv() {
+                    let now = std::time::Instant::now();
+                    let _duration = now.duration_since(last_receive_time);
+
+                    //println!("DEBUG: Tempo dall'ultima ricezione: {}ms | Campioni accumulati nel buffer: {}", _duration.as_millis(), data.len());
+
+                    last_receive_time = now;
+
+                    let readings = process_ntc_packet(&data);
+                    samples_this_second.extend(readings);
+                    println!("RAW HEX: {:02x?}", data);
+
+                    if is_stable_reached {
+                        byte_accumulator.extend(data);
+                    }
+                }
+
+                // Calcolo della media del secondo attuale
+                if !samples_this_second.is_empty() {
+                    let avg_second =
+                        samples_this_second.iter().sum::<f32>() / samples_this_second.len() as f32;
+
+                    if second_averages_buffer.len() >= 60 {
+                        second_averages_buffer.pop_front();
+                    }
+                    second_averages_buffer.push_back(avg_second);
+                }
+
+                // 2. Calcolo Deviazione Standard sulla finestra di 60 medie
+                let sensor_std_dev =
+                    calculate_std_dev(second_averages_buffer.make_contiguous()).unwrap_or(999.0);
 
                 let mut status = "RAMPA".to_string();
                 let mut elapsed = 0u32;
 
+                // 3. Controllo Stabilità combinata
                 if !is_stable_reached {
-                    if f_stable {
+                    // Passa a DWELL se Fluke è OK e la variazione delle medie al secondo è minima (< 0.1)
+                    // Richiediamo almeno 30/40 secondi di dati per una statistica significativa
+                    if f_stable && sensor_std_dev < 0.1 && second_averages_buffer.len() >= 45 {
                         is_stable_reached = true;
                         start_dwell = Some(std::time::Instant::now());
+                        start_time_dwell = Some(chrono::Utc::now());
+                        current_step_ref.clear();
                         status = "DWELL".to_string();
                     }
                 } else if let Some(start) = start_dwell {
                     elapsed = start.elapsed().as_secs() as u32;
                     status = "DWELL".to_string();
-
-                    // Salvataggio campioni durante DWELL
-                    local_ref_buffer.push(RefSample {
-                        index_step: index,
-                        timestamp: Local::now().to_rfc3339(),
-                        target: step.target_value,
-                        reading: f_temp,
-                        stable_hw: f_stable,
-                    });
-
-                    if elapsed >= total_dwell_secs as u32 {
-                        break;
-                    }
+                    current_step_ref.push(f_temp);
                 }
 
-                app.emit(
+                let samples_count = samples_this_second.len();
+                let current_avg = if samples_count > 0 {
+                    samples_this_second.iter().sum::<f32>() / samples_count as f32
+                } else {
+                    // Se non abbiamo ricevuto nulla, prendiamo l'ultima media nota o 0.0
+                    second_averages_buffer.back().cloned().unwrap_or(0.0)
+                };
+
+                println!("ARRIVATO: {}", current_avg);
+
+                // 4. Update UI
+                let _ = app.emit(
                     "calibration-update",
                     &CalibrationPayload {
-                        timestamp: now,
+                        timestamp: chrono::Utc::now().timestamp_millis() as u64,
                         current_temp_fluke: f_temp,
-                        current_temp_sensor: s_temp,
-                        is_stable: f_stable,
+                        current_temp_sensor: current_avg,
+                        samples_count, // Feedback immediato sulla salute della seriale
+                        is_stable: is_stable_reached,
                         current_step: index + 1,
-                        total_steps: _total_steps,
+                        total_steps,
                         elapsed_time: elapsed,
                         total_time: step.tempo_per_step * 60,
                         status,
                     },
-                )
-                .unwrap();
+                );
 
-                std::thread::sleep(Duration::from_millis(1000));
+                if is_stable_reached && elapsed >= total_dwell_secs as u32 {
+                    break;
+                }
+
+                std::thread::sleep(Duration::from_secs(1));
             }
             if !stop_master.load(Ordering::SeqCst) {
                 break;
             }
+
+            // Salvataggio pacchetto Step
+
+            final_steps_reports.push(StepData {
+                target: step.target_value,
+                start_time,
+                start_time_dwell: start_time_dwell.expect("START TIME DWELL MUST BE NOT NULL"),
+                step_index: index,
+                minutes: step.tempo_per_step,
+                ref_readings: current_step_ref,
+                sensor: byte_accumulator,
+                sensor_sampling_freq: freq_campionamento,
+            });
         }
 
         fluke.stop_heating();
         IS_RUNNING.store(false, Ordering::SeqCst);
 
-        // --- ASSEMBLAGGIO FINALE ---
-        {
-            let mut guard = ref_samples_thread2.lock().unwrap();
-            *guard = local_ref_buffer;
-        }
-
-        let calib_id = format!("calib-1-1-{}", Local::now().format("%Y-%m-%dT%H:%M:%S"));
-
-        let final_report = FinalCalibrationReport {
+        // 4. Report Finale
+        let calib_id = format!("calib-1-1-{}", Local::now().format("%Y%m%dT%H%M%S"));
+        let final_report = FinalCompactReport {
             calibration_id: calib_id,
-            calibrator_id: 1,
-            mu_id: 1,
             sensor_id: 1,
-            steps: steps_for_report, // Ora popolato correttamente
-            reference_temperature_samples: ref_samples_thread2.lock().unwrap().clone(),
-            sensor_raw_samples: raw_samples_thread2.lock().unwrap().clone(),
+            sensor_freq_hz: 100,
+            steps: final_steps_reports,
         };
 
-        let report_to_send = serde_json::to_string(&final_report).unwrap();
-        println!("Calibrazione completata. Report generato.");
-        // json_final a MQTT
+        //let report_to_send = serde_json::to_string(&final_report).unwrap();
+
+        // Invio MQTT
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            if let Err(e) = publish_calibration_report(report_to_send).await {
+            if let Err(e) = publish_calibration_report(final_report).await {
                 eprintln!("Fallimento invio finale: {}", e);
             }
         });
@@ -264,33 +298,87 @@ pub fn stop_thermal_calibration() {
     IS_RUNNING.store(false, Ordering::SeqCst);
 }
 
-fn process_ntc_packet(packet: Vec<u8>) -> Vec<f32> {
-    const R0: f32 = 10000.0; // Esempio: 10k Ohm (Valore di riferimento NTC)
-    const B: f32 = 4190.0; // Beta coefficient
-    const T0: f32 = 298.15; // 25°C in Kelvin
-    const ADC_MAX: f32 = 4095.0; // Per un ADC a 12 bit
+fn process_ntc_packet(packet: &[u8]) -> Vec<f32> {
+    const R0: f32 = 10000.0;
+    const B: f32 = 4190.0;
+    const T0: f32 = 298.15;
+    const ADC_MAX: f32 = 4095.0;
 
-    packet
-        .chunks_exact(2)
-        .map(|chunk| {
-            // Lettura Big Endian (corretto, allineato a Python)
-            let raw_val = u16::from_le_bytes([chunk[0], chunk[1]]);
+    let mut results = Vec::new();
 
-            // 1. Protezione contro la divisione per zero
-            if raw_val == 0 {
-                return -273.15; // O un valore di errore predefinito
-            }
+    // Usiamo un ciclo manuale invece di chunks_exact per avere più controllo
+    for chunk in packet.chunks_exact(2) {
+        // Proviamo a leggere. Se raw_val > ADC_MAX, significa che siamo disallineati
+        // (il byte basso è finito al posto di quello alto)
+        let mut raw_val = u16::from_be_bytes([chunk[0], chunk[1]]);
 
-            // 2. Calcolo Resistenza NTC (allineato a Python)
-            // Rntc = R0 * ( (ADC_MAX / sample) - 1 )
-            let r_ntc = R0 * (ADC_MAX / raw_val as f32 - 1.0);
+        // RECUPERO: Se il valore è assurdo, proviamo l'altra endianness (riallineamento software)
+        if raw_val > ADC_MAX as u16 {
+            raw_val = u16::from_le_bytes([chunk[0], chunk[1]]);
+        }
 
-            // 3. Equazione di Steinhart-Hart (Beta)
-            let ln_r = (r_ntc / R0).ln();
-            let t_kelvin = 1.0 / (1.0 / T0 + ln_r / B);
+        // Se dopo il tentativo è ancora fuori range o zero, scartiamo il campione
+        if raw_val == 0 || raw_val >= ADC_MAX as u16 {
+            continue;
+        }
 
-            // 4. Conversione in Celsius (come nel print di Python)
-            t_kelvin - 273.15
+        let r_ntc = R0 * (ADC_MAX / raw_val as f32 - 1.0);
+
+        // Protezione logaritmo: r_ntc deve essere > 0
+        if r_ntc <= 0.0 {
+            continue;
+        }
+
+        let ln_r = (r_ntc / R0).ln();
+        let t_kelvin = 1.0 / (1.0 / T0 + ln_r / B);
+        let t_celsius = t_kelvin - 273.15;
+
+        // Un'ultima protezione: se il sensore segna temperature assurde (es. > 200°C o < -50°C)
+        // probabilmente è ancora rumore di allineamento
+        if t_celsius > -50.0 && t_celsius < 200.0 {
+            results.push(t_celsius);
+        }
+    }
+
+    results
+}
+// Una funzione helper per chiudere tutto e avvisare il frontend
+fn handle_fatal_error(app: &AppHandle, msg: &str) {
+    eprintln!("FATAL: {}", msg);
+    IS_RUNNING.store(false, Ordering::SeqCst);
+    let _ = app.emit("calibration-error", msg);
+}
+
+fn calculate_std_dev(data: &[f32]) -> Option<f32> {
+    let count = data.len();
+    if count < 2 {
+        return None;
+    }
+
+    let mean = data.iter().sum::<f32>() / count as f32;
+    let variance = data
+        .iter()
+        .map(|value| {
+            let diff = mean - value;
+            diff * diff
         })
-        .collect()
+        .sum::<f32>()
+        / count as f32;
+
+    Some(variance.sqrt())
+}
+
+pub fn discover_hardware_id() -> Result<i64, String> {
+    let port_arc = get_or_init_sensor_port().map_err(|e| e.to_string())?;
+    let mut guard = port_arc.lock().map_err(|_| "Porta occupata")?;
+
+    if let Some(ref mut device) = *guard {
+        // Se l'UID è già in memoria lo restituisce, altrimenti interroga la MU
+        if device.extended_uid == 0 {
+            device.connect_mu(0x01).map_err(|e| e.to_string())?;
+        }
+        Ok(device.extended_uid as i64)
+    } else {
+        Err("Dispositivo non inizializzato".into())
+    }
 }

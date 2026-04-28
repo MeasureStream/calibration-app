@@ -370,8 +370,10 @@ dependencies = [
 name = "calibration-app"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "dotenvy",
+ "flate2",
  "lazy_static",
  "once_cell",
  "reqwest",

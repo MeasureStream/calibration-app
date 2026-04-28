@@ -35,10 +35,10 @@ export interface MeasurementUnitDTO {
 /**
  * Chiama il comando Rust per sincronizzare e ottenere le info della MU
  */
-export const getMUInfo = async (): Promise<MeasurementUnitDTO> => {
+export const getMUInfo = async (muId: number): Promise<MeasurementUnitDTO> => {
   try {
     // Nota: Assicurati che il comando tauri ::command in Rust si chiami 'get_mu_info'
-    const response = await invoke<MeasurementUnitDTO>('get_muinfo');
+    const response = await invoke<MeasurementUnitDTO>('get_muinfo', { muId: muId });
     console.log("MU Info ricevuta:", response);
     return response;
   } catch (error) {

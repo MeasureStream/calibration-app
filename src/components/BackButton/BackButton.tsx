@@ -7,7 +7,7 @@ export const BackButton = () => {
 
   return (
     <Button
-      variant="outline-light" // Contrasta bene sullo sfondo dark
+      variant="outline-secondary" // Contrasta bene sullo sfondo dark
       size="lg"
       className="d-flex align-items-center justify-content-center shadow-sm"
       style={{

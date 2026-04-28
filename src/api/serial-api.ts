@@ -12,17 +12,17 @@ export interface CalibrationStep {
  * Rispecchia esattamente il CalibrationPayload inviato dal Master Thread in Rust
  */
 export interface CalibrationPayload {
-  timestamp_ms: number;
+  timestamp: number;          // Rinomina timestamp_ms -> timestamp se hai cambiato in Rust
   current_temp_fluke: number;
-  current_temp_sensor: number[]; // Array di campioni letti nell'ultimo secondo
+  current_temp_sensor: number; // Modificato da number[] a number (la media)
+  samples_count: number;       // Nuovo campo: frequenza campionamento reale
   is_stable: boolean;
   current_step: number;
   total_steps: number;
-  elapsed_time: number; // Secondi passati dall'inizio della stabilità
-  total_time: number;   // Secondi totali di dwell previsti
+  elapsed_time: number;       // Secondi passati nello stato attuale
+  total_time: number;         // Secondi totali di dwell previsti
   status: "RAMPA" | "DWELL";
 }
-
 
 export async function startThermalCalibration(steps: CalibrationStep[]): Promise<void> {
   return await invoke("_start_thermal_calibration", { steps });
@@ -53,6 +53,10 @@ export const onThermalCalibrationUpdate = async (
   });
 };
 
+export async function discoverHardware(): Promise<number> {
+  return await invoke("discover_hardware");
+}
+
 
 export function getCalibrationErrorMessage(err: unknown): string {
   if (typeof err === "string") return err;
@@ -62,3 +66,19 @@ export function getCalibrationErrorMessage(err: unknown): string {
   }
   return "Errore sconosciuto nella calibrazione";
 }
+/**
+ * Ascolta errori asincroni che avvengono durante la marcia (es. distacco hardware)
+ */
+export const onCalibrationError = async (
+  callback: (errorMessage: string) => void
+): Promise<UnlistenFn> => {
+  return await listen<string>("calibration-error", (event) => {
+    const msg = event.payload;
+    if (!msg) return;
+    try {
+      callback(msg);
+    } catch (e) {
+      console.error("Errore callback error handler:", e);
+    }
+  });
+};

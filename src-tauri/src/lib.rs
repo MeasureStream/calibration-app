@@ -24,10 +24,16 @@ async fn _stop_thermal_calibration() {
 
 #[tauri::command]
 async fn get_muinfo(
+    mu_id: i64,
 ) -> Result<measurement_unit::measurement_unit_processor::MeasurementUnitDTO, String> {
-    measurement_unit::measurement_unit_processor::run_sync_process(65537)
+    measurement_unit::measurement_unit_processor::run_sync_process(mu_id)
         .await
         .map_err(|e| e.to_string()) // Converte l'errore in stringa per il frontend
+}
+
+#[tauri::command]
+async fn discover_hardware() -> Result<i64, String> {
+    calibrator::calibrator_manager::discover_hardware_id()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -38,6 +44,7 @@ pub fn run() {
             greet,
             _start_thermal_calibration,
             _stop_thermal_calibration,
+            discover_hardware,
             get_muinfo
         ])
         .run(tauri::generate_context!())

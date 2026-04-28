@@ -1,13 +1,15 @@
-import { useState, useEffect, useRef } from 'react';
-import { Container, Row, Col, Button, ProgressBar, Card } from 'react-bootstrap';
-import { PlayFill, StopFill, ArrowLeft, Cpu, ThermometerHalf } from 'react-bootstrap-icons';
+import { useState, useEffect, } from 'react';
+import { Container, Row, Col, Button, ProgressBar, Card, Alert, Spinner } from 'react-bootstrap';
+import { PlayFill, StopFill, ArrowLeft, Cpu, ThermometerHalf, InfoCircleFill } from 'react-bootstrap-icons';
 import { useNavigate } from 'react-router-dom';
+import CalibrationSummaryModal from '../../components/CalibrationSummaryModal/CalibrationSummaryModal.tsx';
+import { UnlistenFn } from '@tauri-apps/api/event';
 
-// Importiamo le API che abbiamo definito
 import {
   startThermalCalibration,
   stopThermalCalibration,
   onThermalCalibrationUpdate,
+  onCalibrationError,
   CalibrationPayload,
   getCalibrationErrorMessage
 } from '../../api/serial-api.ts';
@@ -16,126 +18,173 @@ const ThermalCalibration = () => {
   const navigate = useNavigate();
   const [isRunning, setIsRunning] = useState(false);
   const [data, setData] = useState<CalibrationPayload | null>(null);
-  const [logs, setLogs] = useState<string[]>([]);
-  const logEndRef = useRef<HTMLDivElement>(null);
+  const [showFinishModal, setShowFinishModal] = useState(false);
+
+  // Gestione messaggi e errori
+  const [error, setError] = useState<string | null>(null);
+  const [infoMessage, setInfoMessage] = useState<string | null>(null);
 
   const steps = [
-    { target_value: 20.0, tempo_per_step: 1 },
-    { target_value: 45.0, tempo_per_step: 2 }
+    { target_value: -22.5, tempo_per_step: 1 },
+    { target_value: 94.5, tempo_per_step: 1 }
   ];
 
-  // Auto-scroll per i log
-  useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
+  // Calcolo progresso globale
+  const globalProgress = data && data.total_steps > 0
+    ? Math.min(100, Math.round(
+      ((data.current_step - 1) / data.total_steps * 100) +
+      (data.elapsed_time / data.total_time * (100 / data.total_steps))
+    ))
+    : 0;
 
-  // Sottoscrizione agli eventi Rust
+  // Monitoraggio fine processo
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    if (globalProgress === 100 && isRunning) {
+      setIsRunning(false);
+      setShowFinishModal(true);
+      setInfoMessage("Processo completato con successo.");
+    }
+  }, [globalProgress, isRunning]);
 
-    const setupListener = async () => {
-      unlisten = await onThermalCalibrationUpdate((payload) => {
+  // Sottoscrizione Eventi Rust
+  useEffect(() => {
+    let unlistenUpdate: UnlistenFn;
+    let unlistenError: UnlistenFn;
+
+    const setupListeners = async () => {
+      unlistenUpdate = await onThermalCalibrationUpdate((payload) => {
         setData(payload);
-
-        // Esempio di log dinamico quando cambia lo stato
-        if (payload.elapsed_time === 1) {
-          addLog(`Step ${payload.current_step}: Inizio fase ${payload.status}`);
+        // Se passiamo a DWELL, informiamo l'utente
+        if (payload.status === "DWELL" && payload.elapsed_time === 1) {
+          setInfoMessage(`Step ${payload.current_step}: Temperatura stabile, registrazione dati in corso...`);
         }
+      });
+
+      unlistenError = await onCalibrationError((msg) => {
+        setError(msg);
+        setIsRunning(false);
+        setInfoMessage(null); // Rimuoviamo info se c'è un errore critico
       });
     };
 
-    setupListener();
-    return () => { if (unlisten) unlisten(); };
+    setupListeners();
+    return () => {
+      if (unlistenUpdate) unlistenUpdate();
+      if (unlistenError) unlistenError();
+    };
   }, []);
 
-  const addLog = (msg: string) => {
-    const time = new Date().toLocaleTimeString();
-    setLogs(prev => [...prev, `[${time}] ${msg}`].slice(-50)); // Ultimi 50 messaggi
-  };
+  // Timer per far scomparire i messaggi Info
+  useEffect(() => {
+    if (infoMessage) {
+      const timer = setTimeout(() => {
+        setInfoMessage(null);
+      }, 5000); // Scompare dopo 5 secondi
+
+      return () => clearTimeout(timer);
+    }
+  }, [infoMessage]);
 
   const handleStart = async () => {
     try {
-      setLogs([]); // Reset log
-      addLog("Inizializzazione strumenti...");
-
-
-
+      setError(null);
+      setInfoMessage("Inizializzazione strumenti in corso...");
       await startThermalCalibration(steps);
       setIsRunning(true);
-      addLog("Taratura avviata con successo.");
     } catch (err) {
       const msg = getCalibrationErrorMessage(err);
-      addLog(`ERRORE: ${msg}`);
+      setError(`Errore durante l'avvio: ${msg}`);
+      setInfoMessage(null);
     }
   };
 
   const handleStop = async () => {
     await stopThermalCalibration();
     setIsRunning(false);
-    addLog("Processo interrotto dall'utente.");
+    setInfoMessage("Processo interrotto manualmente.");
   };
 
-  // Calcolo media sensore (visto che passiamo un array di campioni)
   const getAverageSensorTemp = () => {
-    if (!data || data.current_temp_sensor.length === 0) return "--";
-    const sum = data.current_temp_sensor.reduce((a, b) => a + b, 0);
-    return (sum / data.current_temp_sensor.length).toFixed(2);
-  };
+    // Verifichiamo che i dati esistano. 
+    // Usiamo typeof per permettere la visualizzazione dello 0.00°C
+    if (!data || typeof data.current_temp_sensor !== 'number') return "--";
 
-  // Calcolo progresso globale (basato sugli step totali)
-  const globalProgress = data
-    ? Math.round(((data.current_step - 1) / data.total_steps) * 100 + (data.elapsed_time / data.total_time / data.total_steps * 100))
-    : 0;
+    return data.current_temp_sensor.toFixed(2);
+  };
 
   return (
     <Container fluid className="vh-100 p-0" style={{ backgroundColor: '#f4f7f9', color: '#333' }}>
 
       {/* Header */}
       <div className="d-flex align-items-center bg-white border-bottom px-3 py-2 shadow-sm">
-        <Button variant="light" onClick={() => navigate(-1)} className="me-3 border-0 rounded-circle">
+        <Button
+          variant="light"
+          onClick={() => !isRunning && navigate(-1)}
+          disabled={isRunning} className={`me-3 border-0 rounded-circle ${isRunning ? 'opacity-50' : ''}`}
+          style={{ cursor: isRunning ? 'not-allowed' : 'pointer' }}
+        >
           <ArrowLeft size={24} />
         </Button>
-        <h4 className="mb-0 fw-bold text-primary">Taratura Termica</h4>
+        <h4 className="mb-0 fw-bold text-primary">Thermal Calibration</h4>
         <div className="ms-auto d-flex align-items-center">
           {data?.status === "DWELL" && (
-            <span className="me-3 text-success fw-bold blink">● REGISTRAZIONE DATI</span>
+            <span className="me-3 text-success fw-bold blink">● RECORDING</span>
           )}
           <span className={`badge ${isRunning ? 'bg-success' : 'bg-secondary'} p-2`}>
-            {isRunning ? 'SISTEMA ATTIVO' : 'SISTEMA PRONTO'}
+            {isRunning ? 'ACTIVE' : 'READY'}
           </span>
         </div>
       </div>
 
-      <div className="p-3">
-        <Row className="g-3">
-          {/* Temperatura Fluke (Riferimento) */}
+      <div className="p-4">
+
+        {/* AREA MESSAGGI (Sostituisce il Terminale) */}
+        <div style={{ minHeight: '80px' }}>
+          {error && (
+            <Alert variant="danger" onClose={() => setError(null)} dismissible className="shadow-sm border-0 border-start border-5 border-danger">
+              <div className="d-flex align-items-center">
+                <strong className="me-2">CRITICAL ERROR:</strong> {error}
+              </div>
+            </Alert>
+          )}
+
+          {infoMessage && !error && (
+            <Alert variant="info" onClose={() => setInfoMessage(null)} dismissible className="shadow-sm border-0 border-start border-5 border-info">
+              <div className="d-flex align-items-center">
+                {isRunning && <Spinner animation="border" size="sm" className="me-3" />}
+                <InfoCircleFill className="me-2" />
+                {infoMessage}
+              </div>
+            </Alert>
+          )}
+        </div>
+
+        <Row className="g-3 mt-2">
           <Col xs={4}>
-            <Card className="border-0 shadow-sm mb-3 text-center p-3 h-100">
+            <Card className="border-0 shadow-sm text-center p-3 h-100">
               <ThermometerHalf size={30} className="text-danger mx-auto mb-2" />
               <div className="text-muted small">TEMP. FLUKE (REF)</div>
               <h2 className="fw-bold">{data ? `${data.current_temp_fluke.toFixed(2)}°C` : "--"}</h2>
-              <small className={data?.is_stable ? "text-success" : "text-warning"}>
-                {data?.is_stable ? "STABILE" : "IN RAMPA"}
+              <small className={data?.is_stable ? "text-success fw-bold" : "text-warning fw-bold"}>
+                {data?.is_stable ? "STABLE" : "NOT STABLE"}
               </small>
             </Card>
           </Col>
 
-          {/* Temperatura Sensore (Media campioni) */}
           <Col xs={4}>
-            <Card className="border-0 shadow-sm mb-3 text-center p-3 h-100">
+            <Card className="border-0 shadow-sm text-center p-3 h-100">
               <Cpu size={30} className="text-primary mx-auto mb-2" />
-              <div className="text-muted small">TEMP. SENSORE (AVG)</div>
+              <div className="text-muted small">Sensor Tempetature (AVG)</div>
               <h2 className="fw-bold">{getAverageSensorTemp()}°C</h2>
-              <small className="text-muted">Campioni/sec: {data?.current_temp_sensor.length || 0}</small>
+              <small className="text-muted">Frequency: {data?.samples_count || 0} Hz</small>
             </Card>
           </Col>
 
-          {/* Dettaglio Step */}
           <Col xs={4}>
-            <Card className="border-0 shadow-sm mb-3 text-center p-3 h-100">
+            <Card className="border-0 shadow-sm text-center p-3 h-100">
               <div className="text-muted small mb-2">TARGET STEP {data?.current_step || "--"}</div>
-              <h3 className="fw-bold text-success">
-                {data?.status === "DWELL" ? "DWELL TIME" : "RAMPA"}
+              <h3 className={`fw-bold ${data?.status === "DWELL" ? "text-success" : "text-primary"}`}>
+                {data?.status === "DWELL" ? "DWELL TIME" : "NOT TARGET"}
               </h3>
               <div className="fw-bold fs-4">
                 {data ? `${data.elapsed_time}s / ${data.total_time}s` : "--"}
@@ -144,56 +193,48 @@ const ThermalCalibration = () => {
           </Col>
         </Row>
 
-        {/* Barra di Progresso Globale */}
-        <Card className="border-0 shadow-sm p-4 my-3">
+        <Card className="border-0 shadow-sm p-4 my-4">
           <div className="d-flex justify-content-between fw-bold mb-2">
-            <span>Avanzamento Totale (Step {data?.current_step || 0} di {data?.total_steps || 0})</span>
+            <span>Total Progress (Step {data?.current_step || 0} di {data?.total_steps || 0})</span>
             <span>{globalProgress}%</span>
           </div>
           <ProgressBar
             now={globalProgress}
-            style={{ height: '40px', borderRadius: '10px' }}
+            style={{ height: '45px', borderRadius: '12px' }}
             variant={data?.status === "DWELL" ? "success" : "primary"}
             animated={isRunning && data?.status === "RAMPA"}
           />
         </Card>
 
-        {/* Terminale Log Seriale */}
-        <div className="bg-dark text-light border rounded p-3 mb-3 shadow-sm"
-          style={{ height: '150px', overflowY: 'auto', fontSize: '0.85rem', fontFamily: 'monospace' }}>
-          {logs.map((log, i) => (
-            <div key={i} className={log.includes("ERRORE") ? "text-danger" : ""}>
-              {log}
-            </div>
-          ))}
-          <div ref={logEndRef} />
-        </div>
-
-        {/* Pulsante Azione Gigante */}
-        <Row>
+        <Row className="mt-4">
           <Col>
             {!isRunning ? (
               <Button
                 variant="primary"
-                className="w-100 py-3 fw-bold shadow border-0"
+                className="w-100 py-3 fw-bold shadow-lg border-0"
                 style={{ fontSize: '1.8rem', borderRadius: '15px' }}
                 onClick={handleStart}
               >
-                <PlayFill size={40} /> AVVIA TARATURA
+                <PlayFill size={40} /> START CALIBRATION
               </Button>
             ) : (
               <Button
                 variant="danger"
-                className="w-100 py-3 fw-bold shadow border-0"
+                className="w-100 py-3 fw-bold shadow-lg border-0"
                 style={{ fontSize: '1.8rem', borderRadius: '15px' }}
                 onClick={handleStop}
               >
-                <StopFill size={40} /> ARRESTA PROCESSO
+                <StopFill size={40} /> STOP CALIBRATION
               </Button>
             )}
           </Col>
         </Row>
       </div>
+
+      <CalibrationSummaryModal
+        show={showFinishModal}
+        onDashboard={() => navigate('/')}
+      />
 
       <style>{`
         .blink { animation: blinker 1.5s linear infinite; }

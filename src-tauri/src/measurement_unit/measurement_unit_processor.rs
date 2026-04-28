@@ -86,7 +86,7 @@ async fn get_or_create_mu(
     // aggiungi ip diretto a tailascale measurestream e metti ports 8080:8081
     let base_url = "https://www.christiandellisanti.uk/API/measurementunits";
     let auth_value = format!("Bearer {}", token);
-    println!("DEBUG: Authorization Header: {}...", &auth_value);
+    //println!("DEBUG: Authorization Header: {}...", &auth_value);
 
     // Costruiamo l'URL con il parametro networkId
     let url_with_query = format!("{}?extendedId={}", base_url, mu_to_check.extended_id);
@@ -105,7 +105,7 @@ async fn get_or_create_mu(
 
     if status.is_success() {
         let body_text = response.text().await?;
-        println!("DEBUG: Body ricevuto: {}", body_text); // Decommenta per vedere il JSON grezzo
+        //println!("DEBUG: Body ricevuto: {}", body_text); // Decommenta per vedere il JSON grezzo
 
         let units: Vec<MeasurementUnitDTO> = serde_json::from_str(&body_text)?;
         println!("DEBUG: Numero unità trovate: {}", units.len());

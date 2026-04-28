@@ -82,19 +82,35 @@ impl SerialDevice {
         packet.push(self.local_id); // Byte 0: Local ID MU
         packet.push(0xF1); // Byte 1: Opcode fisso
         packet.push(sensor_id); // Byte 2: #Sensore
-        packet.extend_from_slice(&freq.to_be_bytes()); // Byte 3-4: Freq (u16)
+        packet.extend_from_slice(&freq.to_le_bytes()); // Byte 3-4: Freq (u16)
         packet.push(packet_size); // Byte 5: Packet size
 
+        println!("DEBUG - Buffer inviato (HEX): {:02X?}", packet);
+
         self.port.write_all(&packet).map_err(|e| e.to_string())
     }
 
-    pub fn stop_mu_calibration(&mut self, mu_id: u8, sensor_id: u8) -> Result<(), String> {
-        let packet = vec![mu_id, 0xF2, sensor_id];
-        println!("Sensore Stoppato calibrazione");
-        self.port.write_all(&packet).map_err(|e| e.to_string())
+    pub fn stop_mu_calibration(&mut self, sensor_id: u8) -> Result<(), String> {
+        let _ = self.port.clear(serialport::ClearBuffer::Input);
+        let packet = vec![self.local_id, 0xF2, sensor_id];
+
+        // 1. Log dopo il tentativo di invio o usa un sistema di controllo
+        println!(
+            "Inviando stop calibrazione a MU: {}, Sensor: {}",
+            self.local_id, sensor_id
+        );
+
+        // 2. Usa l'operatore '?' per propagare l'errore se la scrittura fallisce
+        self.port.write_all(&packet).map_err(|e| e.to_string())?;
+
+        // 3. Esegui il flush e restituisci il risultato finale
+        self.port.flush().map_err(|e| e.to_string())?;
+
+        println!("Comando inviato con successo");
+        Ok(())
     }
     /// In modalità streaming è meglio usare bytes_to_read per non bloccare
-    pub fn read_available(&mut self) -> Vec<u8> {
+    pub fn _read_available(&mut self) -> Vec<u8> {
         let mut buffer = Vec::new();
         if let Ok(count) = self.port.bytes_to_read() {
             if count > 0 {
@@ -105,6 +121,21 @@ impl SerialDevice {
             }
         }
         buffer
+    }
+
+    pub fn read_packet(&mut self, packet_size: u8) -> Result<Vec<u8>, String> {
+        // Calcoliamo i byte totali (2 byte per ogni campione NTC)
+        let expected_bytes = packet_size as usize;
+        let mut buffer = vec![0u8; expected_bytes];
+
+        // read_exact blocca il thread corrente finché il buffer non è completamente pieno.
+        // Se non arrivano abbastanza byte entro il timeout (impostato a 1s nel costruttore),
+        // restituirà un errore di tipo TimedOut.
+        self.port
+            .read_exact(&mut buffer)
+            .map_err(|e| format!("Errore durante la lettura del pacchetto: {}", e))?;
+
+        Ok(buffer)
     }
 
     pub fn connect_mu(&mut self, local_id: u8) -> Result<Vec<u8>, String> {
@@ -126,6 +157,7 @@ impl SerialDevice {
             Ok(_) => {
                 self.extended_uid =
                     u32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+                self.local_id = local_id;
                 println!("UID : {}", self.extended_uid);
                 Ok(response)
             }

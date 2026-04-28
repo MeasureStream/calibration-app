@@ -11,6 +11,7 @@ import {
   Search,
   Cpu // Nuova icona per l'hardware
 } from 'react-bootstrap-icons';
+import { discoverHardware } from '../../api/serial-api';
 
 const Home = () => {
   const navigate = useNavigate();
@@ -29,8 +30,11 @@ const Home = () => {
       setLoading(true);
       setError(null);
 
+      const muId = await discoverHardware();
+
       // Chiamata al backend tramite Rust
-      const mu = await getMUInfo();
+      console.log("MUID: ", muId);
+      const mu = await getMUInfo(muId);
       setMu(mu);
       console.log("Hardware sincronizzato:", mu);
 
@@ -87,7 +91,7 @@ const Home = () => {
           ) : (
             <>
               <GraphUp size={iconSize} />
-              TARATURA
+              CALIBRATION
             </>
           )}
         </Button>

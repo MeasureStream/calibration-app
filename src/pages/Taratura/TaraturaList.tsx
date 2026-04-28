@@ -23,7 +23,7 @@ const TaraturaList = () => {
       case 'pressure':
         return { label: 'Taratura Pressione', route: '/taratura/pressure', variant: 'info' };
       case 'humidity':
-        return { label: 'Taratura Umidità', route: '/taratura/humidity', variant: 'warning' };
+        return { label: 'Taratura Umidità', route: '/taratura/humidity', variant: 'outline-primary' };
       case 'accelerometer':
         return { label: 'Taratura Accelerometro', route: '/taratura/accel', variant: 'secondary' };
       default:
