@@ -9,7 +9,6 @@ import {
   GraphUp,
   ArrowRepeat,
   Search,
-  Cpu // Nuova icona per l'hardware
 } from 'react-bootstrap-icons';
 import { discoverHardware } from '../../api/serial-api';
 
