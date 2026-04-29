@@ -158,9 +158,19 @@ pub async fn run_sync_process(
     mu_serial_id: i64,
 ) -> Result<MeasurementUnitDTO, Box<dyn std::error::Error>> {
     // Prova a caricare il .env
-    match dotenvy::dotenv() {
-        Ok(path) => println!("File .env caricato da: {:?}", path),
-        Err(e) => println!("Attenzione: Impossibile caricare il file .env: {}", e),
+    if let Some(config_dir) = dirs::config_dir() {
+        let env_path = config_dir.join("calibration-app").join(".env");
+
+        if env_path.exists() {
+            dotenvy::from_path(&env_path).ok();
+            println!("Caricato correttamente da: {:?}", env_path);
+        } else {
+            println!(
+                "DEBUG: Config non trovata in {:?}, provo fallback locale...",
+                env_path
+            );
+            let _ = dotenvy::dotenv(); // Fallback per sviluppo locale
+        }
     }
 
     // Lettura e stampa delle variabili

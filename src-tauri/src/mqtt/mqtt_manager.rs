@@ -39,12 +39,17 @@ pub async fn publish_calibration_report(report: FinalCompactReport) -> Result<()
         })
         .collect();
 
-    // 2. Setup variabili ambiente (come prima)
-    match dotenvy::dotenv() {
-        Ok(path) => println!("[DEBUG] .env caricato correttamente da: {:?}", path),
-        Err(_) => println!("[DEBUG] ATTENZIONE: File .env non trovato"),
+    // 2. Setup variabili ambiente
+    if let Some(config_dir) = dirs::config_dir() {
+        let env_path = config_dir.join("calibration-app").join(".env");
+        if env_path.exists() {
+            let _ = dotenvy::from_path(&env_path);
+            println!("[DEBUG] MQTT env caricato da: {:?}", env_path);
+        } else {
+            // Fallback directory corrente per sviluppo
+            let _ = dotenvy::dotenv();
+        }
     }
-
     let broker_ip = env::var("MQTT_BROKER_IP").map_err(|_| "MQTT_BROKER_IP non settato")?;
     let broker_port = env::var("MQTT_BROKER_PORT")
         .unwrap_or_else(|_| "1883".to_string())
